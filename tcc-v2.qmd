@@ -23,12 +23,12 @@ print(df.shape)
 
 ```{python}
 # Filtrar apenas as notas desejadas (1, 2, 4, 5)
-df = df[df['Score'].isin([1, 2, 4, 5])]
+df = df[df['Score'].isin([1, 2, 3, 4, 5])]
 
 df = (
-    df[df['Score'].isin([1, 2, 4, 5])]  # Filtra apenas Scores 1, 2, 4, 5
+    df[df['Score'].isin([1, 2, 3, 4, 5])]  # Filtra apenas Scores 1, 2, 4, 5
     .groupby('Score', group_keys=False)   # Agrupa por Score
-    .sample(n=5000, random_state=42)     # Pega 5000 de cada grupo
+    .sample(n=2500, random_state=42)     # Pega 5000 de cada grupo
     .sample(frac=1, random_state=42)     # Embaralha (opcional)
     .reset_index(drop=True)              # Remove o índice antigo
 )
@@ -173,47 +173,74 @@ print(scores_dict)
 É facilmente detectável uma precisão maior em relação ao comentário
 
 ```{python}
+import re
+
+def clean_text(text):
+    text = re.sub(r'<[^>]+>', '', text)  # Remove HTML
+    text = re.sub(r'\s+', ' ', text)      # Remove espaços extras
+    return text.strip()
+
+# No loop principal:
+text = clean_text(row['Text'])
+```
+
+```{python}
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 model = AutoModelForSequenceClassification.from_pretrained(MODEL).to(device)
 
-def polarity_scores_roberta(example):
-    encoded_text = tokenizer(example, return_tensors='pt').to(device)
-    output = model(**encoded_text)
-    scores = output[0][0].detach().cpu().numpy()
-    scores = softmax(scores)
-    return {
-        'roberta_neg': scores[0],
-        'roberta_neu': scores[1],
-        'roberta_pos': scores[2]
-    }
-    return scores_dict
+def polarity_scores_roberta(text):
+    try:
+        encoded_text = tokenizer(text, return_tensors='pt', truncation=True, max_length=512).to(device)
+        with torch.no_grad():
+            output = model(**encoded_text)
+        scores = output[0][0].detach().cpu().numpy()
+        scores = softmax(scores)
+        return {
+            'roberta_neg': float(scores[0]),
+            'roberta_neu': float(scores[1]),
+            'roberta_pos': float(scores[2])
+        }
+    except Exception as e:
+        print(f'Error processing text: {str(e)}')
+        return {
+            'roberta_neg': np.nan,
+            'roberta_neu': np.nan,
+            'roberta_pos': np.nan
+        }
 
 res = {}
 for i, row in tqdm(df.iterrows(), total=len(df)):
     try:
         text = row['Text']
         myid = row['Id']
+        
+        # VADER (sempre funciona)
         vader_result = sia.polarity_scores(text)
-        vader_result_rename = {}
-        for key, value in vader_result.items():
-            vader_result_rename[f"vader_{key}"] = value
+        vader_result_rename = {f"vader_{k}": v for k, v in vader_result.items()}
+        
+        # Roberta (pode falhar)
         roberta_result = polarity_scores_roberta(text)
-        both = {**vader_result_rename, **roberta_result}
-        res[myid] = both
-    except RuntimeError:
-        print(f'Broke for id {myid}')
+        
+        # Combina resultados
+        res[myid] = {**vader_result_rename, **roberta_result, 'Id': myid}
+        
+    except Exception as e:
+        print(f'Critical error for id {myid}: {str(e)}')
+        # Mantém pelo menos os resultados do VADER
+        res[myid] = {**vader_result_rename, 
+                    'roberta_neg': np.nan,
+                    'roberta_neu': np.nan,
+                    'roberta_pos': np.nan,
+                    'Id': myid}
+
+# Cria o DataFrame final
+results_df = pd.DataFrame(res.values()).merge(df, on='Id', how='left')
 ```
 
 ```{python}
-results_df = pd.DataFrame(res).T
-results_df = results_df.reset_index().rename(columns={'index': 'Id'})
-results_df = results_df.merge(df, how='left')
+print(f"Total de linhas processadas: {len(results_df)}")
+print(f"Linhas com falha no Roberta: {results_df['roberta_neg'].isna().sum()}")
 ```
-
-```{python}
-results_df.columns
-```
-
 ## Combinando e comparando os resultados
 
 ```{python}
@@ -247,4 +274,327 @@ results_df.query('Score == 5') \
 ```{python}
 results_df.query('Score == 5') \
     .sort_values('roberta_neg', ascending=True)['Text'].values[0]
+```
+
+### Comparando previsões com o Score do usuario
+
+```{python}
+def map_score_to_label(score):
+    if score in [1, 2]:
+        return 'negativo'
+    elif score == 3:
+        return 'neutro'
+    elif score in [4, 5]:
+        return 'positivo'
+
+results_df['true_label'] = results_df['Score'].apply(map_score_to_label)
+```
+
+```{python}
+def get_binary_prediction(scores_dict):
+    scores = {'negativo': scores_dict['neg'], 'neutro': scores_dict['neu'], 'positivo': scores_dict['pos']}
+    pred = max(scores, key=scores.get)
+    return pred if pred != 'neutro' else 'neutro'  # Mantém neutros se quiser analisar depois
+```
+
+```{python}
+results_df['pred_vader'] = results_df.apply(
+    lambda row: get_binary_prediction({
+        'neg': row['vader_neg'],
+        'neu': row['vader_neu'],
+        'pos': row['vader_pos']
+    }),
+    axis=1
+)
+
+results_df['pred_roberta'] = results_df.apply(
+    lambda row: get_binary_prediction({
+        'neg': row['roberta_neg'],
+        'neu': row['roberta_neu'],
+        'pos': row['roberta_pos']
+    }),
+    axis=1
+)
+```
+
+```{python}
+from sklearn.metrics import classification_report, confusion_matrix
+
+# VADER
+print("Relatório VADER (incluindo neutros):")
+print(classification_report(results_df['true_label'], results_df['pred_vader']))
+
+# ROBERTA
+print("Relatório Roberta (incluindo neutros):")
+print(classification_report(results_df['true_label'], results_df['pred_roberta']))
+
+plt.figure(figsize=(8, 6))
+sns.heatmap(confusion_matrix(results_df['true_label'], results_df['pred_vader']), 
+            annot=True, fmt='d', cmap='Reds',  # Mudei para Reds para diferenciar
+            xticklabels=['negativo', 'neutro', 'positivo'],
+            yticklabels=['negativo', 'neutro', 'positivo'])
+plt.title("Matriz de Confusão - VADER", fontsize=14)
+plt.ylabel('Verdadeiro', fontsize=12)
+plt.xlabel('Predito', fontsize=12)
+plt.show()
+```
+
+```{python}
+sns.heatmap(confusion_matrix(results_df['true_label'], results_df['pred_roberta']), 
+            annot=True, fmt='d', cmap='Blues',
+            xticklabels=['negativo', 'neutro', 'positivo'],
+            yticklabels=['negativo', 'neutro', 'positivo'])
+plt.title("Matriz de Confusão - Roberta")
+plt.ylabel('Verdadeiro')
+plt.xlabel('Predito')
+plt.show()
+```
+
+```{python}
+ig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+# Matriz VADER
+sns.heatmap(confusion_matrix(results_df['true_label'], results_df['pred_vader']), 
+            annot=True, fmt='d', cmap='Reds', ax=ax1,
+            xticklabels=['negativo', 'neutro', 'positivo'],
+            yticklabels=['negativo', 'neutro', 'positivo'])
+ax1.set_title("VADER", fontsize=14)
+ax1.set_ylabel('Verdadeiro', fontsize=12)
+ax1.set_xlabel('Predito', fontsize=12)
+
+# Matriz Roberta
+sns.heatmap(confusion_matrix(results_df['true_label'], results_df['pred_roberta']), 
+            annot=True, fmt='d', cmap='Blues', ax=ax2,
+            xticklabels=['negativo', 'neutro', 'positivo'],
+            yticklabels=['negativo', 'neutro', 'positivo'])
+ax2.set_title("Roberta", fontsize=14)
+ax2.set_ylabel('')
+ax2.set_xlabel('Predito', fontsize=12)
+
+plt.suptitle("Comparação das Matrizes de Confusão", fontsize=16)
+plt.tight_layout()
+plt.show()
+```
+
+### Usando LLM
+
+```{python}
+import ollama
+
+def analyze_sentiment_llm(text):
+    prompt = f"""You are a sentiment classifier. Respond with one of ONLY these words: POSITIVE, NEGATIVE, NEUTRAL. Respond with just one word.
+                   
+    
+Comentário: "{text}"
+Sentimento:"""
+
+    try:
+        response = ollama.generate(
+            model='llama3:8b',
+            prompt=prompt,
+            stream=False
+        )
+        sentiment = response['response'].strip().lower()
+
+        if sentiment in ['negative', 'neutral', 'positive']:
+            return sentiment
+        else:
+            return 'erro'
+
+    except Exception as e:
+        print(f"Erro ao processar: {e}")
+        return 'erro'
+
+```
+
+```{python}
+from concurrent.futures import ThreadPoolExecutor
+
+def process_text(text):
+    try:
+        return analyze_sentiment_llm(text)
+    except:
+        return "neutral"
+
+# Aplica o LLM com paralelismo e barra de progresso
+with ThreadPoolExecutor(max_workers=4) as executor:  # Ajuste o número de workers
+    pred_llm_list = list(tqdm(executor.map(process_text, df_llm['Text']),
+                        total=len(df_llm),
+                        desc="Processando LLM em paralelo"))
+
+df_llm['pred_llm'] = pred_llm_list
+```
+
+```{python} 
+# Exemplo com amostragem
+df_llm = df.sample(n=12500, random_state=42).copy()  # para manter compatibilidade com VADER e RoBERTa
+
+# Aplica o LLM
+df_llm['pred_llm'] = df_llm['Text'].apply(analyze_sentiment_llm)
+```
+
+```{python}
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+
+def calculate_metrics(true, pred):
+    precision, recall, f1, _ = precision_recall_fscore_support(true, pred, 
+                                                            labels=["negative", "neutral", "positive"])
+    acc = accuracy_score(true, pred)
+    return {
+        'precision': list(precision),
+        'recall': list(recall),
+        'f1': list(f1),
+        'accuracy': acc
+    }
+
+# Certifique-se que as colunas existem
+df_llm['true_label'] = df_llm['Score'].apply(lambda x: "negative" if x in [1,2] else ("neutral" if x==3 else "positive"))
+
+# Calcula métricas reais
+llm_metrics = calculate_metrics(df_llm['true_label'], df_llm['pred_llm'])
+```
+
+```{python}
+# 1. Primeiro, vamos tratar os valores 'erro' nas previsões
+print(f"Antes da correção - Contagem de 'erro': {sum(df_llm['pred_llm'] == 'erro')}")
+
+# Substituindo 'erro' por 'neutral' (classe neutra como fallback)
+df_llm['pred_llm'] = df_llm['pred_llm'].replace('erro', 'neutral')
+
+# 2. Verificando as classes novamente
+print("\nClasses após correção:")
+print("true_label:", df_llm['true_label'].unique())
+print("pred_llm:", df_llm['pred_llm'].unique())
+
+# 3. Gerando o relatório com tratamento robusto
+from sklearn.metrics import classification_report
+
+def generate_classification_report(y_true, y_pred):
+    # Garantindo que todas as previsões estão nas classes esperadas
+    valid_classes = ['negative', 'neutral', 'positive']
+    y_pred = y_pred.where(y_pred.isin(valid_classes), 'neutral')
+    
+    return classification_report(
+        y_true=y_true,
+        y_pred=y_pred,
+        labels=valid_classes,
+        target_names=valid_classes,
+        zero_division=0
+    )
+
+print("\nRelatório Completo Corrigido - LLM:")
+print(generate_classification_report(df_llm['true_label'], df_llm['pred_llm']))
+
+# 4. Análise dos casos com erro (opcional)
+if 'erro' in df_llm['pred_llm'].unique():
+    error_samples = df_llm[df_llm['pred_llm'] == 'erro']
+    print(f"\nExemplos que causaram erro ({len(error_samples)} casos):")
+    display(error_samples[['Text', 'Score', 'true_label']].head())
+```
+
+```{python}
+import matplotlib.pyplot as plt
+import numpy as np
+
+categories = ['negative', 'neutral', 'positive']
+metrics = ['precision', 'recall', 'f1']
+models = ['LLM', 'VADER', 'Roberta']
+colors = ['#4CAF50', '#2196F3', '#FF9800']
+
+# Dados consolidados (com seus resultados reais)
+metrics_data = {
+    'LLM': {
+        'precision': [0.83, 0.51, 0.89],
+        'recall': [0.83, 0.53, 0.87],
+        'f1': [0.83, 0.52, 0.88],
+        'accuracy': 0.79
+    },
+    'Roberta': {
+        'precision': [0.79, 0.37, 0.71],
+        'recall': [0.72, 0.24, 0.89],
+        'f1': [0.76, 0.29, 0.79],
+        'accuracy': 0.70
+    },
+    'VADER': {
+        'precision': [1.00, 0.20, 0.96],
+        'recall': [0.00, 1.00, 0.01],
+        'f1': [0.00, 0.33, 0.02],
+        'accuracy': 0.20
+    }
+}
+
+# Configurações do gráfico
+categories = ['negative', 'neutral', 'positive']
+metrics = ['precision', 'recall', 'f1']
+models = ['LLM', 'Roberta', 'VADER']
+colors = ['#4CAF50', '#2196F3', '#FF9800']  # Verde, Azul, Laranja
+bar_width = 0.25
+
+# Gráfico comparativo por métrica
+plt.figure(figsize=(18, 12))
+
+for i, metric in enumerate(metrics):
+    plt.subplot(2, 2, i+1)
+    
+    for j, model in enumerate(models):
+        values = metrics_data[model][metric]
+        x_pos = np.arange(len(categories)) + j * bar_width
+        plt.bar(x_pos, values, width=bar_width, color=colors[j], label=model)
+        
+        # Adiciona valores nas barras
+        for k, v in enumerate(values):
+            plt.text(x_pos[k], v + 0.01, f"{v:.2f}", ha='center', fontsize=10)
+    
+    plt.title(f'{metric.capitalize()} por Classe', fontsize=14)
+    plt.xticks(np.arange(len(categories)) + bar_width, categories)
+    plt.ylim(0, 1.1)
+    plt.legend()
+    plt.grid(axis='y', alpha=0.3)
+
+# Gráfico de Acurácia Comparativa
+plt.subplot(2, 2, 4)
+accuracies = [metrics_data[model]['accuracy'] for model in models]
+bars = plt.bar(models, accuracies, color=colors)
+plt.title('Comparação de Acurácia', fontsize=14)
+plt.ylim(0, 1)
+
+# Adiciona valores nas barras
+for bar in bars:
+    height = bar.get_height()
+    plt.text(bar.get_x() + bar.get_width()/2., height,
+             f"{height:.2f}", ha='center', va='bottom')
+
+plt.grid(axis='y', alpha=0.3)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+plt.figure(figsize=(8, 6))
+sns.set(font_scale=1.2)  # Ajuste do tamanho da fonte
+
+# Cria a visualização da matriz de confusão
+disp = ConfusionMatrixDisplay(confusion_matrix=cm,
+                             display_labels=categories)
+
+# Plot com estilo profissional
+disp.plot(cmap='Blues', ax=plt.gca(), values_format='d', colorbar=False)
+
+# Adiciona título e ajustes estéticos
+plt.title('Matriz de Confusão - Modelo LLM', pad=20, fontsize=16)
+plt.xlabel('Predição', fontsize=14)
+plt.ylabel('Verdadeiro', fontsize=14)
+
+# Adiciona porcentagens nas células
+total_samples = cm.sum()
+for i in range(len(categories)):
+    for j in range(len(categories)):
+        plt.text(j, i, f"{cm[i, j]}\n({cm[i, j]/cm[i].sum():.1%})",
+                ha="center", va="center",
+                color="white" if cm[i, j] > cm.max()/2 else "black",
+                fontsize=12)
+
+plt.grid(False)  # Remove o grid de fundo
+plt.tight_layout()
+plt.show() 
 ```
